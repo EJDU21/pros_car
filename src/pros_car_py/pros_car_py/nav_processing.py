@@ -6,7 +6,17 @@ from pros_car_py.nav2_utils import (
     cal_distance,
 )
 import math
-
+from std_msgs.msg import String
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from sensor_msgs.msg import CompressedImage, Image
+from cv_bridge import CvBridge
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
+import rclpy
+from rclpy.duration import Duration
+import yaml
+import os
+import cv2
 
 class Nav2Processing:
     def __init__(self, ros_communicator, data_processor):
@@ -18,6 +28,77 @@ class Nav2Processing:
         self.index_length = 0
         self.recordFlag = 0
         self.goal_published_flag = False
+        # /-----------------------------------------------------------------------/
+        '''
+        ArUco info Publisher
+        '''
+        self.aruco_pub = self.ros_communicator.create_publisher(
+            String,
+            '/aruco_info',
+            10)
+        
+        '''
+        Camera pose Subscriber
+        '''
+        self.latest_camera_pose = None  # 儲存 Camera pose 資料
+        self.camera_pose_subscriber = self.ros_communicator.create_subscription(
+            PoseWithCovarianceStamped,
+            "/aruco_detector/pose",
+            self.camera_pose_callback,
+            10
+        )
+        
+        '''
+        Camera pose by tf2_ros
+        '''
+        # TF listener setup
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self.ros_communicator)
+
+        '''
+        Camera RGB
+        '''
+        self.latest_rgb_image = None
+        self.bridge = CvBridge()
+        self.rgb_subscriber = self.ros_communicator.create_subscription(
+            CompressedImage,
+            '/camera/image/compressed',
+            self.image_callback,
+            10)
+        # /-----------------------------------------------------------------------/
+        aruco_path = '/workspaces/src/pros_car_py/pros_car_py/aruco_info/living_room_aruco.yaml'
+        if not os.path.exists(aruco_path):
+            print(f"[living_room_nav] YAML 檔案不存在: {aruco_path}")
+            return "STOP"
+
+        with open(aruco_path, 'r') as f:
+            self.aruco_info = yaml.safe_load(f)
+        print("[living_room_nav] aruco_info 載入成功")
+        # /-----------------------------------------------------------------------/
+        map_path = '/workspaces/src/pros_car_py/pros_car_py/map'
+        yaml_path = os.path.join(map_path, 'map01.yaml')
+
+        with open(yaml_path, 'r') as f:
+            map_metadata = yaml.safe_load(f)
+
+        image_path = os.path.join(map_path, map_metadata['image'])
+        resolution = map_metadata['resolution']
+        origin = map_metadata['origin']
+        occupied_thresh = map_metadata.get('occupied_thresh', 0.65)
+
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise RuntimeError(f"無法載入地圖圖片: {image_path}")
+
+        if len(img.shape) == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        img = cv2.flip(img, 0)  # 顛倒 y 軸
+
+        h, w = img.shape
+        self.map = [100 if px < occupied_thresh * 255 else 0 for row in img for px in row]
+        print(f"[living_room_nav] 地圖大小: {w} x {h}，總像素數: {len(self.map)}")
+        # /-----------------------------------------------------------------------/
 
     def reset_nav_process(self):
         self.finishFlag = False
@@ -269,6 +350,98 @@ class Nav2Processing:
         elif any(depth < limit_distance for depth in camera_right_depth):
             action = "COUNTERCLOCKWISE_ROTATION"
         return action
+
+    def publish_aruco_info(self):
+        if not hasattr(self, 'aruco_pub'):
+            print("[publish_aruco_info] Publisher 尚未初始化！")
+            return
+
+        yaml_string = yaml.dump(self.aruco_info)
+        msg = String()
+        msg.data = yaml_string
+        self.aruco_pub.publish(msg)
+        print("[publish_aruco_map] 發布 aruco_info 成功！")
+    
+    def camera_pose_callback(self, msg):
+        self.latest_camera_pose = msg
+        # print(f"[callback] 收到 camera pose: {msg.pose.pose.position.x:.2f}, {msg.pose.pose.position.y:.2f}")
+    
+    def image_callback(self, msg):
+        try:
+            # 將 ROS CompressedImage 轉成 OpenCV 圖片格式
+            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.latest_rgb_image = cv_image
+        except Exception as e:
+            print(f"[image_callback] 解碼圖片失敗: {e}")
+            self.latest_rgb_image = None
+
+    def get_base_pose_from_tf(self):
+        try:
+            trans: TransformStamped = self.tf_buffer.lookup_transform(
+                target_frame="map",
+                source_frame="base_link",
+                time=rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0)
+            )
+            pos = trans.transform.translation
+            ori = trans.transform.rotation
+            return {
+                "position": {"x": pos.x, "y": pos.y, "z": pos.z},
+                "orientation": {"x": ori.x, "y": ori.y, "z": ori.z, "w": ori.w}
+            }
+        except Exception as e:
+            print(f"[TF] 無法取得 base_link 的位置: {e}")
+            return None
+
+
+    def living_room_nav(self):
+        # print(f"[living_room_nav] aruco_info : {self.aruco_info}")
+        # print(f"[living_room_nav] 地圖總像素數: {len(self.map)}")
+    
+        # Publish ArUco_info (給 ArucoDetectorNode)
+        self.publish_aruco_info()
+
+        # Subscribe camera pose (從 ArucoDetectorNode) 
+        camera_pose_msg = self.latest_camera_pose
+        if self.latest_camera_pose is None:
+            print("[living_room_nav] 尚未接收到 Camera pose")
+            return "STOP"
+
+        pos = self.latest_camera_pose.pose.pose.position
+        ori = self.latest_camera_pose.pose.pose.orientation
+        camera_pose = {
+            "position": {"x": pos.x, "y": pos.y, "z": pos.z},
+            "orientation": {"x": ori.x, "y": ori.y, "z": ori.z, "w": ori.w}
+        }
+        print("[living_room_nav] Camera pose:", camera_pose)
+
+        # Subscribe Camera RGB image (從 CameraNode)    
+        if self.latest_rgb_image is None:
+            print("[living_room_nav] 尚未接收到相機影像")
+            return "STOP"
+        print("[living_room_nav] 成功取得 RGB 影像，大小：", self.latest_rgb_image.shape)
+        
+        # Subscribe camera pose (by tf2_ros)
+        camera_pose_from_tf = self.get_base_pose_from_tf()
+        if camera_pose_from_tf is None:
+            print("[living_room_nav] 無法從 TF 取得 camera pose")
+            return "STOP"
+
+        print("[living_room_nav] TF Pose:", camera_pose_from_tf)
+
+
+        # 這邊你可以根據 pose 控制導航或設定導航目標
+        """
+        self.map
+        self.aruco_info
+        camera_pose
+        camera_pose_from_tf
+        self.latest_rgb_image
+        """
+        # 目前先回傳 STOP 作為 placeholder
+        return "STOP"
+    
+
 
     def stop_nav(self):
         return "STOP"

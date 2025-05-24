@@ -151,10 +151,18 @@ class CarController:
                     self.target_idx = (self.target_idx + 1) % len(self.target_list)
                     continue
             # 發布控制指令
-
+            # ////////////////////////////////////////////////////////////////////////////
             elif mode == "custom_nav":
-                action_key = self.nav_processing.camera_nav_unity()
-
+                # action_key = self.nav_processing.camera_nav_unity()
+                action_key = self.nav_processing.living_room_nav()
+            elif mode == "random_living_room_nav":
+                action_key = self.nav_processing.random_living_room_nav()
+            elif mode == "random_door_room_nav":
+                action_key = self.nav_processing.random_door_room_nav()
+            elif mode == "random_pikachu_room_nav":
+                action_key = self.nav_processing.random_pikachu_room_nav()
+            # ///////////////////////////////////////////////////////////////////////////
+            
             if self._thread_running == False:
                 action_key = "STOP"
             print(action_key)
